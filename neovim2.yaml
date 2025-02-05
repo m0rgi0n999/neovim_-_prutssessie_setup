@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template to create 15 t2.micro Ubuntu instances with unique key pairs using Auto Scaling
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: "CIDR block for VPC"
+
+  SubnetCidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: "CIDR block for Subnet"
+
+  InstanceType:
+    Type: String
+    Default: "t2.micro"
+    AllowedValues:
+      - "t2.medium"
+      - "t2.micro"
+    Description: "Choose instance type."
+
+  AmiId:
+    Type: String
+    Default: "ami-03fd334507439f4d1" # Replace with your AMI ID
+    Description: "Ubuntu AMI for eu-west-1"
+
+
+Resources:
+
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !Ref SubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: MySubnet
+
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  MyRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref MyInternetGateway
+
+  MySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MySubnet
+      RouteTableId: !Ref MyRouteTable
+
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH from anywhere"
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+
+  KeyPairResources: # This now handles multiple key pairs
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Properties:
+      Count: 15
+
+  MyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        UserData: !Base64 |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install -y openssh-server
+          /opt/aws/bin/cfn-signal -e 0 -r KeyPairResources -s ${AWS::StackId} # Signal after userdata
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub UbuntuInstance-${AWS::CloudFormation::Loop::Index} # Unique instance names
+
+  KeyPairs:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub KeyPair-${AWS::CloudFormation::Loop::Index}
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            "/home/ubuntu/.ssh/authorized_keys":
+              source: !GetAtt KeyPairs.PublicKey
+              mode: "000400"
+          commands:
+            01_signal_keypair:
+              command: !Sub |
+                /opt/aws/bin/cfn-signal -e 0 -r KeyPairResources -s ${AWS::StackId}
+
+  MyAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: "MyASG"
+      VPCZoneIdentifier:
+        - !Ref MySubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MyLaunchTemplate
+        Version: !GetAtt MyLaunchTemplate.LatestVersionNumber
+      MinSize: 15
+      MaxSize: 15
+      DesiredCapacity: 15
+      # IMPORTANT: Availability Zones should be based on your subnet's AZs
+      AvailabilityZones: !GetAZs eu-west-1 # Or specify AZs explicitly if needed
+
+Outputs:
+  # This output is just for the *names* of the key pairs.
+  KeyPairNames:
+    Description: Names of the generated KeyPairs
+    Value: !Join [ ",", !Map [ "KeyPairs", "KeyName", !Ref KeyPairs ] ]
